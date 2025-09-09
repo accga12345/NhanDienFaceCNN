@@ -2,89 +2,94 @@ import tkinter as tk
 from tkinter import filedialog
 from PIL import Image, ImageTk
 import cv2
-import joblib
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.applications import MobileNetV2
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D
+import joblib
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.applications.resnet50 import preprocess_input
+from mtcnn import MTCNN
+from sklearn.preprocessing import normalize
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ================================
-# 1. Load Haarcascade và SVM
+# 1. Load MTCNN Detector
 # ================================
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-svm_loaded = joblib.load("face_svm_finetune.pkl")  # SVM đã train với 256-dim feature
+detector = MTCNN()
 
-# Mapping ID -> tên
+# ================================
+# 2. Load SVM
+# ================================
+svm_loaded = joblib.load("face_recognition_resnet50.pkl")
+
+# Mapping ID -> tên (cập nhật theo dataset)
 id_to_name = {
-    1: "Minh Anh",
-    2: "Linh",
-    3: "Vu",
-    4: "Son"
+    "1": "Minh Anh",
+    "2": "Linh",
+    "3": "Vu",
+    "4": "Son"
 }
 
 # ================================
-# 2. Tạo feature_model giống lúc train SVM
+# 3. ResNet50 feature extractor
 # ================================
-base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(224,224,3))
-for layer in base_model.layers:
+resnet_model = ResNet50(weights='imagenet', include_top=False, pooling='avg', input_shape=(224,224,3))
+for layer in resnet_model.layers:
     layer.trainable = False
 
-x = base_model.output
-x = GlobalAveragePooling2D()(x)
-x = Dropout(0.5)(x)
-x = Dense(256, activation='relu')(x)
-feature_model = Model(inputs=base_model.input, outputs=x)
+def extract_features(imgs):
+    features = []
+    for img in imgs:
+        x_input = preprocess_input(img.astype(np.float32))
+        x_input = np.expand_dims(x_input, axis=0)
+        feat = resnet_model.predict(x_input, verbose=0)
+        features.append(feat.flatten())
+    return np.array(features)
 
 # ================================
-# 3. Hàm detect + crop face
+# 4. Detect + crop face
 # ================================
-def detect_and_crop_face(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30,30))
-    if len(faces) > 0:
-        x, y, w, h = faces[0]
-        margin = 20
-        x = max(0, x - margin)
-        y = max(0, y - margin)
-        w = min(img.shape[1] - x, w + 2*margin)
-        h = min(img.shape[0] - y, h + 2*margin)
-        face = img[y:y+h, x:x+w]
-        face_resized = cv2.resize(face, (224, 224))
-        return face_resized, (x, y, x+w, y+h)
-    return None, None
+def detect_and_crop_faces(img):
+    results = detector.detect_faces(img)
+    face_list = []
+    bboxes = []
+
+    for result in results:
+        x, y, w, h = result['box']
+        x, y = max(0, x), max(0, y)
+        x2, y2 = min(img.shape[1], x + w), min(img.shape[0], y + h)
+        if x2 - x <= 0 or y2 - y <= 0:
+            continue
+        face_img = img[y:y2, x:x2]
+        face_img = cv2.resize(face_img, (224, 224))
+        face_list.append(face_img)
+        bboxes.append((x, y, x2, y2))
+
+    # fallback resize toàn bộ frame nếu không detect
+    if len(face_list) == 0:
+        face_list.append(cv2.resize(img, (224, 224)))
+        bboxes.append((0,0,img.shape[1], img.shape[0]))
+
+    return face_list, bboxes
 
 # ================================
-# 4. Hàm extract feature
+# 5. Nhận diện + vẽ
 # ================================
-def extract_features(img):
-    img_preprocessed = preprocess_input(img.astype(np.float32))
-    img_batch = np.expand_dims(img_preprocessed, axis=0)
-    features = feature_model.predict(img_batch, verbose=0)
-    return features.flatten()
+def recognize_and_show(frame_bgr):
+    img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    faces, bboxes = detect_and_crop_faces(img_rgb)
 
-# ================================
-# 5. Hàm nhận diện + vẽ
-# ================================
-def recognize_and_show(img_bgr):
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    face_crop, bbox = detect_and_crop_face(img_rgb)
-
-    if face_crop is None:
-        cv2.putText(img_rgb, "Khong tim thay khuon mat", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-    else:
-        features = extract_features(face_crop).reshape(1, -1)
-        pred_label = svm_loaded.predict(features)[0]
-        pred_prob = svm_loaded.predict_proba(features).max()
-        name = id_to_name.get(pred_label, f"ID {pred_label}")
+    for face, bbox in zip(faces, bboxes):
+        feat = extract_features([face])
+        feat_norm = normalize(feat, norm='l2')
+        pred_label = svm_loaded.predict(feat_norm)[0]
+        pred_prob = svm_loaded.predict_proba(feat_norm).max()
+        name = id_to_name.get(str(pred_label), f"ID {pred_label}")
 
         x1, y1, x2, y2 = bbox
         cv2.rectangle(img_rgb, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(img_rgb, f"Ten : {name} ({pred_prob:.2f})",
-                    (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8, (0, 255, 0), 2)
+        cv2.putText(img_rgb, f"{name} ({pred_prob*100:.2f}%)",
+                    (x1, max(0, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
     return img_rgb
 
 # ================================
@@ -94,9 +99,9 @@ root = tk.Tk()
 root.title("Face Recognition Demo")
 root.geometry("900x700")
 
-cap = None
 panel = tk.Label(root, bg="gray")
 panel.pack(pady=20)
+cap = None
 
 def open_file():
     global panel, cap
@@ -108,20 +113,20 @@ def open_file():
     if not file_path:
         return
 
-    # Đọc ảnh hỗ trợ Unicode
     with open(file_path, 'rb') as f:
         file_bytes = np.frombuffer(f.read(), np.uint8)
     img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
     img_rgb = recognize_and_show(img_bgr)
-    img_rgb = cv2.resize(img_rgb, (640, 480))
+    img_rgb = cv2.resize(img_rgb, (640,480))
     img_tk = ImageTk.PhotoImage(Image.fromarray(img_rgb))
     panel.config(image=img_tk)
     panel.image = img_tk
 
 def open_camera():
     global cap
-    cap = cv2.VideoCapture(0)
+    if cap is None:
+        cap = cv2.VideoCapture(0)
     show_frame()
 
 def show_frame():
@@ -130,13 +135,12 @@ def show_frame():
         ret, frame = cap.read()
         if ret:
             img_rgb = recognize_and_show(frame)
-            img_rgb = cv2.resize(img_rgb, (640, 480))
+            img_rgb = cv2.resize(img_rgb, (640,480))
             img_tk = ImageTk.PhotoImage(Image.fromarray(img_rgb))
             panel.config(image=img_tk)
             panel.image = img_tk
-        panel.after(10, show_frame)
+        panel.after(30, show_frame)
 
-# Nút chức năng
 btn_frame = tk.Frame(root)
 btn_frame.pack()
 
